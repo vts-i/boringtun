@@ -86,11 +86,21 @@ enum Action {
 // Event handler function
 type Handler = Box<dyn Fn(&mut LockReadGuard<Device>, &mut ThreadData) -> Action + Send + Sync>;
 
+pub trait Tun: AsRawFd + Send + Sync {
+    fn name(&self) -> Result<String, Error>;
+    fn mtu(&self) -> Result<usize, Error>;
+
+    fn write4(&self, src: &[u8]) -> usize;
+    fn write6(&self, src: &[u8]) -> usize;
+    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error>;
+}
+
 pub struct DeviceHandle {
     device: Arc<Lock<Device>>, // The interface this handle owns
     threads: Vec<JoinHandle<()>>,
 }
 
+#[derive(Clone)]
 pub struct DeviceConfig {
     pub n_threads: usize,
     pub log_level: Verbosity,
@@ -118,7 +128,7 @@ pub struct Device {
     listen_port: u16,
     fwmark: Option<u32>,
 
-    iface: Arc<TunSocket>,
+    iface: Arc<dyn Tun>,
     udp4: Option<Arc<UDPSocket>>,
     udp6: Option<Arc<UDPSocket>>,
 
@@ -140,22 +150,25 @@ pub struct Device {
 }
 
 struct ThreadData {
-    iface: Arc<TunSocket>,
+    iface: Arc<dyn Tun>,
     src_buf: [u8; MAX_UDP_SIZE],
     dst_buf: [u8; MAX_UDP_SIZE],
 }
 
 impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
-        let n_threads = config.n_threads;
-        let mut wg_interface = Device::new(name, config)?;
+        let mut wg_interface = Device::new(name, config.clone())?;
         wg_interface.open_listen_socket(0)?; // Start listening on a random port
 
+        Self::from_device(wg_interface, config)
+    }
+
+    pub fn from_device(wg_interface: Device, config: DeviceConfig) -> Result<DeviceHandle, Error> {
         let interface_lock = Arc::new(Lock::new(wg_interface));
 
         let mut threads = vec![];
 
-        for i in 0..n_threads {
+        for i in 0..config.n_threads {
             threads.push({
                 let dev = Arc::clone(&interface_lock);
                 thread::spawn(move || DeviceHandle::event_loop(i, &dev))
@@ -250,6 +263,59 @@ impl Drop for DeviceHandle {
 }
 
 impl Device {
+    pub fn new(name: &str, config: DeviceConfig) -> Result<Device, Error> {
+        let iface = Arc::new(TunSocket::new(name)?.set_non_blocking()?);
+
+        Self::from_iface(name, config, iface)
+    }
+
+    pub fn from_iface(
+        name: &str,
+        config: DeviceConfig,
+        iface: Arc<dyn Tun>,
+    ) -> Result<Device, Error> {
+        let poll = EventPoll::<Handler>::new()?;
+        let mtu = iface.mtu()?;
+
+        let mut device = Device {
+            queue: Arc::new(poll),
+            iface,
+            config,
+            exit_notice: Default::default(),
+            yield_notice: Default::default(),
+            fwmark: Default::default(),
+            key_pair: Default::default(),
+            listen_port: Default::default(),
+            next_index: Default::default(),
+            peers: Default::default(),
+            peers_by_idx: Default::default(),
+            peers_by_ip: Default::default(),
+            udp4: Default::default(),
+            udp6: Default::default(),
+            cleanup_paths: Default::default(),
+            mtu: AtomicUsize::new(mtu),
+            rate_limiter: None,
+        };
+
+        device.register_api_handler()?;
+        device.register_iface_handler(Arc::clone(&device.iface))?;
+        device.register_notifiers()?;
+        device.register_timers()?;
+
+        #[cfg(target_os = "macos")]
+        {
+            // Only for macOS write the actual socket name into WG_TUN_NAME_FILE
+            if let Ok(name_file) = std::env::var("WG_TUN_NAME_FILE") {
+                if name == "utun" {
+                    std::fs::write(&name_file, device.iface.name().unwrap().as_bytes()).unwrap();
+                    device.cleanup_paths.push(name_file);
+                }
+            }
+        }
+
+        Ok(device)
+    }
+
     fn next_index(&mut self) -> u32 {
         let next_index = self.next_index;
         self.next_index += 1;
@@ -329,52 +395,6 @@ impl Device {
         }
 
         peer.log(Verbosity::Info, "Peer added");
-    }
-
-    pub fn new(name: &str, config: DeviceConfig) -> Result<Device, Error> {
-        let poll = EventPoll::<Handler>::new()?;
-
-        // Create a tunnel device
-        let iface = Arc::new(TunSocket::new(name)?.set_non_blocking()?);
-        let mtu = iface.mtu()?;
-
-        let mut device = Device {
-            queue: Arc::new(poll),
-            iface,
-            config,
-            exit_notice: Default::default(),
-            yield_notice: Default::default(),
-            fwmark: Default::default(),
-            key_pair: Default::default(),
-            listen_port: Default::default(),
-            next_index: Default::default(),
-            peers: Default::default(),
-            peers_by_idx: Default::default(),
-            peers_by_ip: Default::default(),
-            udp4: Default::default(),
-            udp6: Default::default(),
-            cleanup_paths: Default::default(),
-            mtu: AtomicUsize::new(mtu),
-            rate_limiter: None,
-        };
-
-        device.register_api_handler()?;
-        device.register_iface_handler(Arc::clone(&device.iface))?;
-        device.register_notifiers()?;
-        device.register_timers()?;
-
-        #[cfg(target_os = "macos")]
-        {
-            // Only for macOS write the actual socket name into WG_TUN_NAME_FILE
-            if let Ok(name_file) = std::env::var("WG_TUN_NAME_FILE") {
-                if name == "utun" {
-                    std::fs::write(&name_file, device.iface.name().unwrap().as_bytes()).unwrap();
-                    device.cleanup_paths.push(name_file);
-                }
-            }
-        }
-
-        Ok(device)
     }
 
     fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
@@ -725,7 +745,7 @@ impl Device {
         Ok(())
     }
 
-    fn register_iface_handler(&self, iface: Arc<TunSocket>) -> Result<(), Error> {
+    fn register_iface_handler(&self, iface: Arc<dyn Tun>) -> Result<(), Error> {
         self.queue.new_event(
             iface.as_raw_fd(),
             Box::new(move |d, t| {

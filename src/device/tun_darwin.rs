@@ -8,6 +8,8 @@ use std::mem::size_of_val;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::ptr::null_mut;
 
+use crate::device::Tun;
+
 pub fn errno() -> i32 {
     unsafe { *__error() }
 }
@@ -140,26 +142,6 @@ impl TunSocket {
         Ok(TunSocket { fd })
     }
 
-    pub fn name(&self) -> Result<String, Error> {
-        let mut tunnel_name = [0u8; 256];
-        let mut tunnel_name_len: socklen_t = tunnel_name.len() as u32;
-        if unsafe {
-            getsockopt(
-                self.fd,
-                SYSPROTO_CONTROL,
-                UTUN_OPT_IFNAME,
-                tunnel_name.as_mut_ptr() as _,
-                &mut tunnel_name_len,
-            )
-        } < 0
-            || tunnel_name_len == 0
-        {
-            return Err(Error::GetSockOpt(errno_str()));
-        }
-
-        Ok(String::from_utf8_lossy(&tunnel_name[..(tunnel_name_len - 1) as usize]).to_string())
-    }
-
     pub fn set_non_blocking(self) -> Result<TunSocket, Error> {
         match unsafe { fcntl(self.fd, F_GETFL) } {
             -1 => Err(Error::FCntl(errno_str())),
@@ -168,31 +150,6 @@ impl TunSocket {
                 _ => Ok(self),
             },
         }
-    }
-
-    /// Get the current MTU value
-    pub fn mtu(&self) -> Result<usize, Error> {
-        let fd = match unsafe { socket(AF_INET, SOCK_STREAM, IPPROTO_IP) } {
-            -1 => return Err(Error::Socket(errno_str())),
-            fd => fd,
-        };
-
-        let name = self.name()?;
-        let iface_name: &[u8] = name.as_ref();
-        let mut ifr = ifreq {
-            ifr_name: [0; IF_NAMESIZE],
-            ifr_ifru: IfrIfru { ifru_mtu: 0 },
-        };
-
-        ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
-
-        if unsafe { ioctl(fd, SIOCGIFMTU, &ifr) } < 0 {
-            return Err(Error::IOCtl(errno_str()));
-        }
-
-        unsafe { close(fd) };
-
-        Ok(unsafe { ifr.ifr_ifru.ifru_mtu } as _)
     }
 
     fn write(&self, src: &[u8], af: u8) -> usize {
@@ -223,16 +180,63 @@ impl TunSocket {
             n => n as usize,
         }
     }
+}
 
-    pub fn write4(&self, src: &[u8]) -> usize {
+impl Tun for TunSocket {
+    fn name(&self) -> Result<String, Error> {
+        let mut tunnel_name = [0u8; 256];
+        let mut tunnel_name_len: socklen_t = tunnel_name.len() as u32;
+        if unsafe {
+            getsockopt(
+                self.fd,
+                SYSPROTO_CONTROL,
+                UTUN_OPT_IFNAME,
+                tunnel_name.as_mut_ptr() as _,
+                &mut tunnel_name_len,
+            )
+        } < 0
+            || tunnel_name_len == 0
+        {
+            return Err(Error::GetSockOpt(errno_str()));
+        }
+
+        Ok(String::from_utf8_lossy(&tunnel_name[..(tunnel_name_len - 1) as usize]).to_string())
+    }
+
+    /// Get the current MTU value
+    fn mtu(&self) -> Result<usize, Error> {
+        let fd = match unsafe { socket(AF_INET, SOCK_STREAM, IPPROTO_IP) } {
+            -1 => return Err(Error::Socket(errno_str())),
+            fd => fd,
+        };
+
+        let name = self.name()?;
+        let iface_name: &[u8] = name.as_ref();
+        let mut ifr = ifreq {
+            ifr_name: [0; IF_NAMESIZE],
+            ifr_ifru: IfrIfru { ifru_mtu: 0 },
+        };
+
+        ifr.ifr_name[..iface_name.len()].copy_from_slice(iface_name);
+
+        if unsafe { ioctl(fd, SIOCGIFMTU, &ifr) } < 0 {
+            return Err(Error::IOCtl(errno_str()));
+        }
+
+        unsafe { close(fd) };
+
+        Ok(unsafe { ifr.ifr_ifru.ifru_mtu } as _)
+    }
+
+    fn write4(&self, src: &[u8]) -> usize {
         self.write(src, AF_INET as u8)
     }
 
-    pub fn write6(&self, src: &[u8]) -> usize {
+    fn write6(&self, src: &[u8]) -> usize {
         self.write(src, AF_INET6 as u8)
     }
 
-    pub fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
+    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
         let mut hdr = [0u8; 4];
 
         let mut iov = [
