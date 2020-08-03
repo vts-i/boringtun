@@ -97,7 +97,38 @@ pub fn parse_utun_name(name: &str) -> Result<u32, Error> {
 }
 
 impl TunSocket {
-    pub fn new(name: &str) -> Result<TunSocket, Error> {
+    fn write(&self, src: &[u8], af: u8) -> usize {
+        let mut hdr = [0u8, 0u8, 0u8, af as u8];
+        let mut iov = [
+            iovec {
+                iov_base: hdr.as_mut_ptr() as _,
+                iov_len: hdr.len(),
+            },
+            iovec {
+                iov_base: src.as_ptr() as _,
+                iov_len: src.len(),
+            },
+        ];
+
+        let msg_hdr = msghdr {
+            msg_name: null_mut(),
+            msg_namelen: 0,
+            msg_iov: &mut iov[0],
+            msg_iovlen: iov.len() as _,
+            msg_control: null_mut(),
+            msg_controllen: 0,
+            msg_flags: 0,
+        };
+
+        match unsafe { sendmsg(self.fd, &msg_hdr, 0) } {
+            -1 => 0,
+            n => n as usize,
+        }
+    }
+}
+
+impl Tun for TunSocket {
+    fn new(name: &str) -> Result<TunSocket, Error> {
         let idx = parse_utun_name(name)?;
 
         let fd = match unsafe { socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL) } {
@@ -142,7 +173,7 @@ impl TunSocket {
         Ok(TunSocket { fd })
     }
 
-    pub fn set_non_blocking(self) -> Result<TunSocket, Error> {
+    fn set_non_blocking(self) -> Result<TunSocket, Error> {
         match unsafe { fcntl(self.fd, F_GETFL) } {
             -1 => Err(Error::FCntl(errno_str())),
             flags => match unsafe { fcntl(self.fd, F_SETFL, flags | O_NONBLOCK) } {
@@ -152,37 +183,6 @@ impl TunSocket {
         }
     }
 
-    fn write(&self, src: &[u8], af: u8) -> usize {
-        let mut hdr = [0u8, 0u8, 0u8, af as u8];
-        let mut iov = [
-            iovec {
-                iov_base: hdr.as_mut_ptr() as _,
-                iov_len: hdr.len(),
-            },
-            iovec {
-                iov_base: src.as_ptr() as _,
-                iov_len: src.len(),
-            },
-        ];
-
-        let msg_hdr = msghdr {
-            msg_name: null_mut(),
-            msg_namelen: 0,
-            msg_iov: &mut iov[0],
-            msg_iovlen: iov.len() as _,
-            msg_control: null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-        };
-
-        match unsafe { sendmsg(self.fd, &msg_hdr, 0) } {
-            -1 => 0,
-            n => n as usize,
-        }
-    }
-}
-
-impl Tun for TunSocket {
     fn name(&self) -> Result<String, Error> {
         let mut tunnel_name = [0u8; 256];
         let mut tunnel_name_len: socklen_t = tunnel_name.len() as u32;

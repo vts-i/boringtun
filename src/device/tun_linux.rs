@@ -66,7 +66,16 @@ impl AsRawFd for TunSocket {
 }
 
 impl TunSocket {
-    pub fn new(name: &str) -> Result<TunSocket, Error> {
+    fn write(&self, buf: &[u8]) -> usize {
+        match unsafe { write(self.fd, buf.as_ptr() as _, buf.len() as _) } {
+            -1 => 0,
+            n => n as usize,
+        }
+    }
+}
+
+impl Tun for TunSocket {
+    fn new(name: &str) -> Result<TunSocket, Error> {
         let fd = match unsafe { open(b"/dev/net/tun\0".as_ptr() as _, O_RDWR) } {
             -1 => return Err(Error::Socket(errno_str())),
             fd => fd,
@@ -94,7 +103,7 @@ impl TunSocket {
         Ok(TunSocket { fd, name })
     }
 
-    pub fn set_non_blocking(self) -> Result<TunSocket, Error> {
+    fn set_non_blocking(self) -> Result<TunSocket, Error> {
         match unsafe { fcntl(self.fd, F_GETFL) } {
             -1 => Err(Error::FCntl(errno_str())),
             flags => match unsafe { fcntl(self.fd, F_SETFL, flags | O_NONBLOCK) } {
@@ -104,15 +113,6 @@ impl TunSocket {
         }
     }
 
-    fn write(&self, buf: &[u8]) -> usize {
-        match unsafe { write(self.fd, buf.as_ptr() as _, buf.len() as _) } {
-            -1 => 0,
-            n => n as usize,
-        }
-    }
-}
-
-impl Tun for TunSocket {
     fn name(&self) -> Result<String, Error> {
         Ok(self.name.clone())
     }

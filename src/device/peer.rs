@@ -1,7 +1,6 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use crate::device::udp::UDPSocket;
 use crate::device::*;
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -13,7 +12,7 @@ pub struct Endpoint<S: Sock> {
     pub conn: Option<Arc<S>>,
 }
 
-pub struct Peer<S: Sock = UDPSocket> {
+pub struct Peer<S: Sock> {
     pub(crate) tunnel: Box<Tunn>, // The associated tunnel struct
     index: u32,                   // The index the tunnel uses
     endpoint: spin::RwLock<Endpoint<S>>,
@@ -95,11 +94,7 @@ impl<S: Sock> Peer<S> {
         };
     }
 
-    pub fn connect_endpoint(
-        &self,
-        port: u16,
-        fwmark: Option<u32>,
-    ) -> Result<Arc<S>, Error> {
+    pub fn connect_endpoint(&self, port: u16, fwmark: Option<u32>) -> Result<Arc<S>, Error> {
         let mut endpoint = self.endpoint.write();
 
         if endpoint.conn.is_some() {
