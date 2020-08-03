@@ -86,6 +86,7 @@ enum Action {
 // Event handler function
 type Handler = Box<dyn Fn(&mut LockReadGuard<Device>, &mut ThreadData) -> Action + Send + Sync>;
 
+// The trait satisfied by tunnel device implementations.
 pub trait Tun: AsRawFd + Send + Sync {
     fn name(&self) -> Result<String, Error>;
     fn mtu(&self) -> Result<usize, Error>;
@@ -93,6 +94,27 @@ pub trait Tun: AsRawFd + Send + Sync {
     fn write4(&self, src: &[u8]) -> usize;
     fn write6(&self, src: &[u8]) -> usize;
     fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error>;
+}
+
+// The trait satisfied by UDP socket implementations.
+pub trait Sock: 'static + AsRawFd + Sized + Send + Sync {
+    fn new() -> Result<Self, Error>;
+    fn new6() -> Result<Self, Error>;
+
+    fn bind(self, port: u16) -> Result<Self, Error>;
+    fn connect(self, dst: &SocketAddr) -> Result<Self, Error>;
+
+    fn set_non_blocking(self) -> Result<Self, Error>;
+    fn set_reuse(self) -> Result<Self, Error>;
+    fn set_fwmark(&self, mark: u32) -> Result<(), Error>;
+
+    fn port(&self) -> Result<u16, Error>;
+    fn sendto(&self, buf: &[u8], dst: SocketAddr) -> usize;
+    fn recvfrom<'a>(&self, buf: &'a mut [u8]) -> Result<(SocketAddr, &'a mut [u8]), Error>;
+    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error>;
+    fn write(&self, src: &[u8]) -> usize;
+
+    fn shutdown(&self);
 }
 
 pub struct DeviceHandle {
@@ -121,7 +143,7 @@ impl Default for DeviceConfig {
     }
 }
 
-pub struct Device {
+pub struct Device<S: Sock = UDPSocket> {
     key_pair: Option<(Arc<X25519SecretKey>, Arc<X25519PublicKey>)>,
     queue: Arc<EventPoll<Handler>>,
 
@@ -129,8 +151,8 @@ pub struct Device {
     fwmark: Option<u32>,
 
     iface: Arc<dyn Tun>,
-    udp4: Option<Arc<UDPSocket>>,
-    udp6: Option<Arc<UDPSocket>>,
+    udp4: Option<Arc<S>>,
+    udp6: Option<Arc<S>>,
 
     yield_notice: Option<EventRef>,
     exit_notice: Option<EventRef>,
@@ -157,7 +179,7 @@ struct ThreadData {
 
 impl DeviceHandle {
     pub fn new(name: &str, config: DeviceConfig) -> Result<DeviceHandle, Error> {
-        let mut wg_interface = Device::new(name, config.clone())?;
+        let mut wg_interface = Device::<UDPSocket>::new(name, config.clone())?;
         wg_interface.open_listen_socket(0)?; // Start listening on a random port
 
         Self::from_device(wg_interface, config)
@@ -262,7 +284,7 @@ impl Drop for DeviceHandle {
     }
 }
 
-impl Device {
+impl<S: Sock> Device<S> {
     pub fn new(name: &str, config: DeviceConfig) -> Result<Device, Error> {
         let iface = Arc::new(TunSocket::new(name)?.set_non_blocking()?);
 
@@ -417,7 +439,7 @@ impl Device {
 
         // Then open new sockets and bind to the port
         let udp_sock4 = Arc::new(
-            UDPSocket::new()?
+            S::new()?
                 .set_non_blocking()?
                 .set_reuse()?
                 .bind(port)?,
@@ -429,7 +451,7 @@ impl Device {
         }
 
         let udp_sock6 = Arc::new(
-            UDPSocket::new6()?
+            S::new6()?
                 .set_non_blocking()?
                 .set_reuse()?
                 .bind(port)?,
@@ -590,7 +612,7 @@ impl Device {
             .stop_notification(self.yield_notice.as_ref().unwrap())
     }
 
-    fn register_udp_handler(&self, udp: Arc<UDPSocket>) -> Result<(), Error> {
+    fn register_udp_handler(&self, udp: Arc<S>) -> Result<(), Error> {
         self.queue.new_event(
             udp.as_raw_fd(),
             Box::new(move |d, t| {
@@ -689,7 +711,7 @@ impl Device {
     fn register_conn_handler(
         &self,
         peer: Arc<Peer>,
-        udp: Arc<UDPSocket>,
+        udp: Arc<S>,
         peer_addr: IpAddr,
     ) -> Result<(), Error> {
         self.queue.new_event(
