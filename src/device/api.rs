@@ -186,7 +186,7 @@ fn api_set<T: Tun, S: Sock>(
             return 0; // Done
         }
         {
-            let parsed_cmd: Vec<&str> = cmd.split('=').collect();
+            let parsed_cmd: Vec<&str> = cmd.splitn(2, '=').collect();
             if parsed_cmd.len() != 2 {
                 return EPROTO;
             }
