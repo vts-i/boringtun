@@ -81,7 +81,7 @@ type LogFunction = Box<dyn Fn(&str) + Send>;
 /// Tunnel represents a point-to-point WireGuard connection
 pub struct Tunn {
     handshake: spin::Mutex<handshake::Handshake>, // The handshake currently in progress
-    sessions: [Arc<spin::RwLock<Option<session::Session>>>; N_SESSIONS], // The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
+    sessions: [spin::RwLock<Option<session::Session>>; N_SESSIONS], // The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
     current: AtomicUsize, // Index of most recently used session
     packet_queue: spin::Mutex<VecDeque<Vec<u8>>>, // Queue to store blocked packets
     timers: timers::Timers, // Keeps tabs on the expiring timers
