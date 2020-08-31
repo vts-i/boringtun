@@ -78,12 +78,38 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
 
 type LogFunction = Box<dyn Fn(&str) + Send>;
 
+struct HandshakeData {
+    handshake: handshake::Handshake, // The handshake currently in progress
+    packet_queue: VecDeque<Vec<u8>>, // Queue to store blocked packets
+}
+
+impl HandshakeData {
+    // Push packet to the back of the queue
+    fn queue_packet(&mut self, packet: &[u8]) {
+        if self.packet_queue.len() < MAX_QUEUE_DEPTH {
+            // Drop if too many are already in queue
+            self.packet_queue.push_back(packet.to_vec());
+        }
+    }
+
+    // Push packet to the front of the queue
+    fn requeue_packet(&mut self, packet: Vec<u8>) {
+        if self.packet_queue.len() < MAX_QUEUE_DEPTH {
+            // Drop if too many are already in queue
+            self.packet_queue.push_front(packet);
+        }
+    }
+
+    fn dequeue_packet(&mut self) -> Option<Vec<u8>> {
+        self.packet_queue.pop_front()
+    }
+}
+
 /// Tunnel represents a point-to-point WireGuard connection
 pub struct Tunn {
-    handshake: spin::Mutex<handshake::Handshake>, // The handshake currently in progress
+    handshake: spin::Mutex<HandshakeData>,
     sessions: [spin::RwLock<Option<session::Session>>; N_SESSIONS], // The N_SESSIONS most recent sessions, index is session id modulo N_SESSIONS
-    current: AtomicUsize, // Index of most recently used session
-    packet_queue: spin::Mutex<VecDeque<Vec<u8>>>, // Queue to store blocked packets
+    current: AtomicUsize,   // Index of most recently used session
     timers: timers::Timers, // Keeps tabs on the expiring timers
     tx_bytes: AtomicUsize,
     rx_bytes: AtomicUsize,
@@ -157,8 +183,8 @@ impl Tunn {
         let static_public = Arc::new(static_private.public_key());
 
         let tunn = Tunn {
-            handshake: spin::Mutex::new(
-                Handshake::new(
+            handshake: spin::Mutex::new(HandshakeData {
+                handshake: Handshake::new(
                     static_private,
                     Arc::clone(&static_public),
                     peer_static_public,
@@ -166,13 +192,13 @@ impl Tunn {
                     preshared_key,
                 )
                 .map_err(|_| "Invalid parameters")?,
-            ),
+                packet_queue: VecDeque::new(),
+            }),
             sessions: Default::default(),
             current: Default::default(),
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
 
-            packet_queue: spin::Mutex::new(VecDeque::new()),
             timers: Timers::new(persistent_keepalive, rate_limiter.is_none()),
 
             logger: None,
@@ -205,6 +231,7 @@ impl Tunn {
         });
         self.handshake
             .lock()
+            .handshake
             .set_static_private(static_private, static_public)?;
         for s in &self.sessions {
             *s.write() = None;
@@ -218,6 +245,15 @@ impl Tunn {
     /// Panics if dst buffer is too small.
     /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
     pub fn encapsulate<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+        self.encapsulate_with_guard(None, src, dst)
+    }
+
+    fn encapsulate_with_guard<'a>(
+        &self,
+        hs_data: Option<&mut spin::MutexGuard<HandshakeData>>,
+        src: &[u8],
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
         let current = self.current.load(Ordering::SeqCst);
         if let Some(ref session) = *self.sessions[current % N_SESSIONS].read() {
             // Send the packet using an established session
@@ -228,10 +264,18 @@ impl Tunn {
             return TunnResult::WriteToNetwork(packet);
         }
 
-        // If there is no session, queue the packet for future retry
-        self.queue_packet(src);
-        // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+        match hs_data {
+            None => {
+                let mut hs_data = self.handshake.lock();
+                self.encapsulate_with_guard(Some(&mut hs_data), src, dst)
+            }
+            Some(hs_data) => {
+                // If there is no session, queue the packet for future retry
+                hs_data.queue_packet(src);
+                // Initiate a new handshake if none is in progress
+                self.format_handshake_initiation_with_guard(hs_data, dst, false)
+            }
+        }
     }
 
     /// Receives a UDP datagram from the network and parses it.
@@ -324,10 +368,8 @@ impl Tunn {
     ) -> Result<TunnResult<'a>, WireGuardError> {
         self.log(Verbosity::Debug, "Received handshake_initiation");
 
-        let (packet, session) = {
-            let mut handshake = self.handshake.lock();
-            handshake.receive_handshake_initialization(p, dst)?
-        };
+        let mut hs_data = self.handshake.lock();
+        let (packet, session) = hs_data.handshake.receive_handshake_initialization(p, dst)?;
 
         // Store new session in ring buffer
         let index = session.local_index() % N_SESSIONS;
@@ -348,10 +390,8 @@ impl Tunn {
     ) -> Result<TunnResult<'a>, WireGuardError> {
         self.log(Verbosity::Debug, "Received handshake_response");
 
-        let session = {
-            let mut handshake = self.handshake.lock();
-            handshake.receive_handshake_response(p)?
-        };
+        let mut hs_data = self.handshake.lock();
+        let session = hs_data.handshake.receive_handshake_response(p)?;
 
         let keepalive_packet = session.format_packet_data(&[], dst);
         // Store new session in ring buffer
@@ -372,10 +412,10 @@ impl Tunn {
         p: PacketCookieReply,
     ) -> Result<TunnResult<'a>, WireGuardError> {
         self.log(Verbosity::Debug, "Received cookie_reply");
-        {
-            let mut handshake = self.handshake.lock();
-            handshake.receive_cookie_reply(p)?;
-        }
+
+        let mut hs_data = self.handshake.lock();
+        hs_data.handshake.receive_cookie_reply(p)?;
+
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeCookieReceived);
 
@@ -385,17 +425,28 @@ impl Tunn {
 
     // Update the index of the currently used session, if needed
     fn set_current_session(&self, new_idx: usize) {
-        let cur_idx = self.current.load(Ordering::Relaxed);
+        let cur_idx = self.current.load(Ordering::SeqCst);
         if cur_idx == new_idx {
             // There is nothing to do, already using this session, this is the common case
+            return;
+        }
+
+        // Acquire the handshake lock to serialize these reads with any other threads, even though
+        // we're not working on the handshake.
+        let guard = self.handshake.lock();
+        let cur_idx = self.current.load(Ordering::SeqCst);
+
+        if cur_idx == new_idx {
             return;
         }
         if self.sessions[cur_idx].read().is_none()
             || self.timers.session_timers[new_idx].time()
                 >= self.timers.session_timers[cur_idx].time()
         {
-            self.current.store(new_idx, Ordering::Relaxed);
+            self.current.store(new_idx, Ordering::SeqCst);
         }
+
+        drop(guard);
     }
 
     // Decrypts a data packet, and stores the decapsulated packet in dst.
@@ -427,18 +478,27 @@ impl Tunn {
         dst: &'a mut [u8],
         force_resend: bool,
     ) -> TunnResult<'a> {
-        let mut handshake = self.handshake.lock();
-        if handshake.is_in_progress() && !force_resend {
+        let mut hs_data = self.handshake.lock();
+        self.format_handshake_initiation_with_guard(&mut hs_data, dst, force_resend)
+    }
+
+    fn format_handshake_initiation_with_guard<'a>(
+        &self,
+        hs_data: &mut spin::MutexGuard<HandshakeData>,
+        dst: &'a mut [u8],
+        force_resend: bool,
+    ) -> TunnResult<'a> {
+        if hs_data.handshake.is_in_progress() && !force_resend {
             return TunnResult::Done;
         }
 
-        if handshake.is_expired() {
+        if hs_data.handshake.is_expired() {
             self.timers.clear();
         }
 
-        let starting_new_handshake = !handshake.is_in_progress();
+        let starting_new_handshake = !hs_data.handshake.is_in_progress();
 
-        match handshake.format_handshake_initiation(dst) {
+        match hs_data.handshake.format_handshake_initiation(dst) {
             Ok(packet) => {
                 self.log(Verbosity::Debug, "Sending handshake_initiation");
                 if starting_new_handshake {
@@ -507,39 +567,17 @@ impl Tunn {
 
     // Get a packet from the queue, and try to encapsulate it
     fn send_queued_packet<'a>(&self, dst: &'a mut [u8]) -> TunnResult<'a> {
-        if let Some(packet) = self.dequeue_packet() {
-            match self.encapsulate(&packet, dst) {
+        let mut hs_data = self.handshake.lock();
+        if let Some(packet) = hs_data.dequeue_packet() {
+            match self.encapsulate_with_guard(Some(&mut hs_data), &packet, dst) {
                 TunnResult::Err(_) => {
                     // On error, return packet to the queue
-                    self.requeue_packet(packet);
+                    hs_data.requeue_packet(packet);
                 }
                 r => return r,
             }
         }
         TunnResult::Done
-    }
-
-    // Push packet to the back of the queue
-    fn queue_packet(&self, packet: &[u8]) {
-        let mut q = self.packet_queue.lock();
-        if q.len() < MAX_QUEUE_DEPTH {
-            // Drop if too many are already in queue
-            q.push_back(packet.to_vec());
-        }
-    }
-
-    // Push packet to the front of the queue
-    fn requeue_packet(&self, packet: Vec<u8>) {
-        let mut q = self.packet_queue.lock();
-        if q.len() < MAX_QUEUE_DEPTH {
-            // Drop if too many are already in queue
-            q.push_front(packet);
-        }
-    }
-
-    fn dequeue_packet(&self) -> Option<Vec<u8>> {
-        let mut q = self.packet_queue.lock();
-        q.pop_front()
     }
 
     fn estimate_loss(&self) -> f32 {
@@ -595,17 +633,17 @@ impl Tunn {
         let tx_bytes = self.tx_bytes.load(Ordering::Relaxed);
         let rx_bytes = self.rx_bytes.load(Ordering::Relaxed);
         let loss = self.estimate_loss();
-        let rtt = self.handshake.lock().last_rtt;
+        let rtt = self.handshake.lock().handshake.last_rtt;
 
         (time, tx_bytes, rx_bytes, loss, rtt)
     }
 
     pub fn is_expired(&self) -> bool {
-        self.handshake.lock().is_expired()
+        self.handshake.lock().handshake.is_expired()
     }
 
     pub fn preshared_key(&self) -> Option<[u8; 32]> {
-        self.handshake.lock().preshared_key()
+        self.handshake.lock().handshake.preshared_key()
     }
 }
 
