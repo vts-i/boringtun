@@ -8,6 +8,7 @@ use std::ops::Deref;
 use std::os::unix::io::RawFd;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
+use std::thread;
 
 /// A return type for the EventPoll::wait() function
 pub enum WaitResult<'a, H> {
@@ -190,6 +191,9 @@ impl<H: Send + Sync> EventPoll<H> {
             return WaitResult::Error(errno_str());
         }
 
+        thread::sleep(Duration::from_secs(1));
+        println!("ptr: {:?}", event.udata);
+
         let event_data = unsafe { (event.udata as *mut Event<H>).as_ref().unwrap() };
 
         let guard = EventGuard {
@@ -218,6 +222,7 @@ impl<H: Send + Sync> EventPoll<H> {
             EventKind::Timer | EventKind::Notifier => (-(events.len() as RawFd) - 1, events.len()), // Custom events get negative identifiers, hopefully we will never have more than 2^31 events of each type
         };
 
+        println!("events: {:?} {:?}", index, events.capacity());
         // Expand events vector if needed
         while events.len() <= index {
             // Resize the vector to be able to fit the new index
@@ -238,6 +243,7 @@ impl<H: Send + Sync> EventPoll<H> {
         }
 
         if let Some(mut event) = events[index].take() {
+            event.event.ident = 77;
             // Properly remove any previous event first
             event.event.flags = EV_DELETE;
             unsafe { kevent(self.kqueue, &event.event, 1, null_mut(), 0, null()) };
@@ -325,6 +331,7 @@ impl<'a, H> Drop for EventGuard<'a, H> {
 impl<'a, H> EventGuard<'a, H> {
     /// Cancel and remove the event represented by this guard
     pub fn cancel(self) {
+        println!("cancel: {:?}", self.event.event.ident);
         unsafe { self.poll.clear_event_by_fd(self.event.event.ident as RawFd) };
         std::mem::forget(self); // Don't call the regular drop that would enable the event
     }

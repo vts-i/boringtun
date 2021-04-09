@@ -8,6 +8,7 @@ use std::ops::Deref;
 use std::os::unix::io::RawFd;
 use std::ptr::null_mut;
 use std::time::Duration;
+use std::thread;
 
 /// A return type for the EventPoll::wait() function
 pub enum WaitResult<'a, H> {
@@ -118,7 +119,7 @@ impl<H: Sync + Send> EventPoll<H> {
     }
 
     /// Add and enable a new timed event with the factory.
-    /// The even will be triggered for the first time after period time, and henceforth triggered
+    /// The event will be triggered for the first time after period time, and henceforth triggered
     /// every period time. Period is counted from the moment the appropriate EventGuard is released.
     pub fn new_periodic_event(&self, handler: H, period: Duration) -> Result<EventRef, Error> {
         // The periodic event on Linux uses the timerfd
@@ -228,6 +229,8 @@ impl<H: Sync + Send> EventPoll<H> {
             _ => return WaitResult::Error("unexpected number of events returned".to_string()),
         }
 
+        thread::sleep(Duration::from_secs(1));
+        println!("ptr: {:?}", event.u64);
         let event_data = unsafe { (event.u64 as *mut Event<H>).as_mut().unwrap() };
 
         let guard = EventGuard {
@@ -269,17 +272,26 @@ impl<H: Sync + Send> EventPoll<H> {
     // Insert an event into the events vector
     fn insert_at(&self, index: usize, data: Box<Event<H>>) {
         let mut events = self.events.lock();
+        println!("events: {:?} {:?}", index, events.capacity());
+        // What we need to see is that pointer to box has moved too.
         while events.len() <= index {
             // Resize the vector to be able to fit the new index
             // We trust the OS to allocate file descriptors in a sane order
             events.push(None); // resize doesn't work because Clone is not satisfied
         }
 
+        if events[index].is_some() {
+            events[index].as_mut().unwrap().fd = 77;
+        }
         if events[index].take().is_some() {
             // Properly remove the previous event first
-            unsafe {
-                epoll_ctl(self.epoll, EPOLL_CTL_DEL, index as _, null_mut());
+            let res = unsafe {
+                epoll_ctl(self.epoll, EPOLL_CTL_DEL, index as _, null_mut())
             };
+            if res == -1 {
+                println!("{:?}", errno_str());
+            }
+            // assert_ne!(res, -1);
         }
 
         events[index] = Some(data);
@@ -378,6 +390,7 @@ impl<'a, H> EventGuard<'a, H> {
 
     /// Cancel and remove the event referenced by this guard
     pub fn cancel(self) {
+        println!("cancel: {:?}", self.event.fd);
         unsafe { self.poll.clear_event_by_fd(self.event.fd) };
         std::mem::forget(self); // Don't call the regular drop that would enable the event
     }
